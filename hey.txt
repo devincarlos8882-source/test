@@ -1,0 +1,318 @@
+#!/bin/bash
+#==============================================================================
+# MS-HOF-HUNTER - Microsoft Hall of Fame Recon & Automation Pipeline
+# Author: HackerAI
+# Description: Automated recon + vuln discovery for Microsoft bug bounty
+#==============================================================================
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+
+# --- Configuration ---
+OUTPUT_DIR="${HOME}/ms-hof-hunter"
+mkdir -p "$OUTPUT_DIR"
+MICROSOFT_DOMAINS=(
+    "microsoft.com" "office.com" "office365.com" "azure.com" "azure.net"
+    "outlook.com" "outlook.office365.com" "outlook.live.com"
+    "sharepoint.com" "sharepointonline.com" "onedrive.live.com" "onedrive.com"
+    "teams.microsoft.com" "teams.live.com" "lync.com"
+    "bing.com" "copilot.microsoft.com" "copilot.ai"
+    "portal.office.com" "admin.microsoft.com"
+    "sway.com" "forms.office.com" "tasks.office.com"
+    "dynamics.com" "powerapps.com" "powerbi.com"
+    "live.com" "login.live.com" "account.live.com"
+    "visualstudio.com" "github.com" "githubusercontent.com"
+)
+
+echo -e "${CYAN}=========================================================${NC}"
+echo -e "${CYAN}   MS-HOF-HUNTER - Microsoft Hall of Fame Auto Pipeline   ${NC}"
+echo -e "${CYAN}=========================================================${NC}"
+
+# ====================================================
+# PHASE 1: TOOL INSTALLATION CHECK & DEPENDENCIES
+# ====================================================
+check_tools() {
+    echo -e "${YELLOW}[*] Checking dependencies...${NC}"
+    TOOLS=("subfinder" "httpx" "nuclei" "gau" "katana" "waybackurls" "gf" "dalfox" "qsreplace" "unfurl" "naabu")
+    MISSING=()
+    for tool in "${TOOLS[@]}"; do
+        if ! command -v "$tool" &>/dev/null; then
+            MISSING+=("$tool")
+        fi
+    done
+    if [ ${#MISSING[@]} -gt 0 ]; then
+        echo -e "${YELLOW}[!] Missing tools: ${MISSING[*]}${NC}"
+        echo -e "${YELLOW}[!] Install with: go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest${NC}"
+        echo -e "${YELLOW}[!] And similar for the others. Install nuclei templates too.${NC}"
+    fi
+}
+
+# ====================================================
+# PHASE 2: SUBDOMAIN ENUMERATION
+# ====================================================
+enum_subdomains() {
+    local domain="$1"
+    local label="$2"
+    echo -e "${GREEN}[+] Enumerating subdomains for ${domain} (${label})${NC}"
+    local outfile="${OUTPUT_DIR}/${label}_subdomains.txt"
+    
+    # Multiple sources for maximum coverage
+    subfinder -d "$domain" -silent -o "${OUTPUT_DIR}/${label}_subfinder.txt" 2>/dev/null
+    
+    # crt.sh certificate transparency
+    curl -s "https://crt.sh/?q=%25.${domain}&output=json" 2>/dev/null | \
+        jq -r '.[].name_value' 2>/dev/null | sed 's/\*\.//g' | sort -u >> "${OUTPUT_DIR}/${label}_crt.txt" 2>/dev/null
+    
+    # Combine all sources
+    cat "${OUTPUT_DIR}/${label}_subfinder.txt" "${OUTPUT_DIR}/${label}_crt.txt" 2>/dev/null | \
+        sort -u > "$outfile"
+    
+    echo -e "${GREEN}[+] Found $(wc -l < "$outfile") subdomains for ${domain}${NC}"
+}
+
+# ====================================================
+# PHASE 3: LIVE HOST FILTERING
+# ====================================================
+filter_live() {
+    local label="$1"
+    echo -e "${GREEN}[+] Filtering live hosts for ${label}...${NC}"
+    httpx -l "${OUTPUT_DIR}/${label}_subdomains.txt" \
+        -silent -threads 100 \
+        -status-code -title -tech-detect \
+        -o "${OUTPUT_DIR}/${label}_live.txt" 2>/dev/null
+    
+    # Extract just URLs for further processing
+    awk '{print $1}' "${OUTPUT_DIR}/${label}_live.txt" > "${OUTPUT_DIR}/${label}_urls.txt"
+    echo -e "${GREEN}[+] $(wc -l < "${OUTPUT_DIR}/${label}_urls.txt") live hosts${NC}"
+}
+
+# ====================================================
+# PHASE 4: URL COLLECTION (Wayback, Gau, Katana)
+# ====================================================
+collect_urls() {
+    local label="$1"
+    echo -e "${GREEN}[+] Collecting historical & crawling URLs for ${label}...${NC}"
+    
+    # Gau (getallurls) - from wayback, otx, commoncrawl
+    cat "${OUTPUT_DIR}/${label}_subdomains.txt" | gau --threads 10 --o "${OUTPUT_DIR}/${label}_gau.txt" 2>/dev/null
+    
+    # Katana crawler
+    katana -list "${OUTPUT_DIR}/${label}_urls.txt" -silent -d 2 -jc -kf all \
+        -o "${OUTPUT_DIR}/${label}_katana.txt" 2>/dev/null
+    
+    # Combine and deduplicate
+    cat "${OUTPUT_DIR}/${label}_gau.txt" "${OUTPUT_DIR}/${label}_katana.txt" 2>/dev/null | \
+        sort -u > "${OUTPUT_DIR}/${label}_all_urls.txt"
+    
+    echo -e "${GREEN}[+] Collected $(wc -l < "${OUTPUT_DIR}/${label}_all_urls.txt") URLs${NC}"
+}
+
+# ====================================================
+# PHASE 5: VULNERABILITY PATTERN DETECTION
+# ====================================================
+find_vulns() {
+    local label="$1"
+    echo -e "${YELLOW}[*] Running vulnerability pattern detection...${NC}"
+    mkdir -p "${OUTPUT_DIR}/vulns/${label}"
+    
+    # --- 5a: Parameter analysis for potential injection points ---
+    echo -e "${CYAN}[*] Extracting parameters for injection testing...${NC}"
+    cat "${OUTPUT_DIR}/${label}_all_urls.txt" 2>/dev/null | \
+        grep -E '(\?|&)(id|q|s|search|query|url|page|redirect|return|next|file|document|cmd|exec|debug|token|api_key|secret|password|passwd|auth)' > \
+        "${OUTPUT_DIR}/vulns/${label}_interesting_params.txt"
+    
+    # --- 5b: Secret/key exposure scanning ---
+    echo -e "${CYAN}[*] Scanning for exposed secrets/keys...${NC}"
+    cat "${OUTPUT_DIR}/${label}_all_urls.txt" 2>/dev/null | \
+        grep -E '(api_key|apikey|secret|token|password|passwd|connection_string|azure_key|storage_account)' | \
+        grep -vE '(example|test|sample|demo)' > \
+        "${OUTPUT_DIR}/vulns/${label}_secrets.txt"
+    
+    # --- 5c: Open redirect detection ---
+    echo -e "${CYAN}[*] Testing for open redirects...${NC}"
+    cat "${OUTPUT_DIR}/${label}_all_urls.txt" 2>/dev/null | \
+        grep -E '(redirect=|url=|link=|return=|next=|from=|dest=|destination=)' > \
+        "${OUTPUT_DIR}/vulns/${label}_redirect_candidates.txt"
+    
+    # --- 5d: XSS candidate URLs ---
+    echo -e "${CYAN}[*] Identifying XSS-prone parameters...${NC}"
+    cat "${OUTPUT_DIR}/${label}_all_urls.txt" 2>/dev/null | \
+        grep -E '(\?|&)(q|s|search|query|keyword|term|name|title|msg|message|text|comment|content)' > \
+        "${OUTPUT_DIR}/vulns/${label}_xss_candidates.txt"
+    
+    # --- 5e: SQLi candidate URLs ---
+    echo -e "${CYAN}[*] Identifying SQLi-prone endpoints...${NC}"
+    cat "${OUTPUT_DIR}/${label}_all_urls.txt" 2>/dev/null | \
+        grep -E '(\?|&)(id=|page=|cat=|product=|user=|item=|article=|news=|view=)' > \
+        "${OUTPUT_DIR}/vulns/${label}_sqli_candidates.txt"
+    
+    # --- 5f: SSRF-prone parameters ---
+    echo -e "${CYAN}[*] Identifying SSRF-prone parameters...${NC}"
+    cat "${OUTPUT_DIR}/${label}_all_urls.txt" 2>/dev/null | \
+        grep -E '(url=|uri=|src=|href=|load=|file=|page=|dest=|path=|image=|img=|css=)' > \
+        "${OUTPUT_DIR}/vulns/${label}_ssrf_candidates.txt"
+    
+    # --- 5g: LFI/Path traversal ---
+    echo -e "${CYAN}[*] Identifying LFI/path traversal candidates...${NC}"
+    cat "${OUTPUT_DIR}/${label}_all_urls.txt" 2>/dev/null | \
+        grep -E '(file=|path=|include=|require=|template=|doc=|document=|page=|folder=|dir=|root=)' > \
+        "${OUTPUT_DIR}/vulns/${label}_lfi_candidates.txt"
+    
+    echo -e "${GREEN}[+] Vuln pattern extraction complete for ${label}${NC}"
+}
+
+# ====================================================
+# PHASE 6: NUCLEI AUTOMATED SCANNING
+# ====================================================
+run_nuclei() {
+    local label="$1"
+    echo -e "${YELLOW}[*] Running Nuclei vulnerability scanner on ${label}...${NC}"
+    
+    nuclei -l "${OUTPUT_DIR}/${label}_urls.txt" \
+        -severity critical,high,medium \
+        -etags osint,tech \
+        -o "${OUTPUT_DIR}/vulns/${label}_nuclei.txt" \
+        -silent 2>/dev/null
+    
+    echo -e "${GREEN}[+] Nuclei scan complete. Found $(wc -l < "${OUTPUT_DIR}/vulns/${label}_nuclei.txt") potential issues${NC}"
+}
+
+# ====================================================
+# PHASE 7: MICROSOFT-SPECIFIC CHECKS
+# ====================================================
+microsoft_specific_checks() {
+    local label="$1"
+    echo -e "${YELLOW}[*] Running Microsoft-specific vulnerability checks...${NC}"
+    
+    # Check for Azure misconfigurations / exposed storage
+    echo -e "${CYAN}[*] Checking for exposed Azure resources...${NC}"
+    if cat "${OUTPUT_DIR}/${label}_subdomains.txt" 2>/dev/null | grep -qiE '(blob\.core\.windows\.net|table\.core\.windows\.net|queue\.core\.windows\.net|file\.core\.windows\.net)'; then
+        echo -e "${RED}[!] Potential Azure storage endpoint found! Check for open containers.${NC}"
+        cat "${OUTPUT_DIR}/${label}_subdomains.txt" 2>/dev/null | \
+            grep -iE '(blob\.core\.windows\.net)' > "${OUTPUT_DIR}/vulns/${label}_azure_blobs.txt"
+    fi
+    
+    # Check for exposed .git/config files Microsoft-owned repos
+    echo -e "${CYAN}[*] Checking for exposed git repos...${NC}"
+    while IFS= read -r url; do
+        curl -skL "${url}/.git/config" -o /dev/null -w "%{http_code}" 2>/dev/null | \
+            grep -q "200" && echo -e "${RED}[!] Exposed .git: ${url}/.git/config${NC}" >> \
+            "${OUTPUT_DIR}/vulns/${label}_exposed_git.txt"
+    done < "${OUTPUT_DIR}/${label}_urls.txt" 2>/dev/null
+    
+    # Check for directory listing
+    echo -e "${CYAN}[*] Checking for directory listing...${NC}"
+    while IFS= read -r url; do
+        local response
+        response=$(curl -skL -m 5 "${url}/" 2>/dev/null)
+        if echo "$response" | grep -qiE '(Index of|Directory listing|Parent Directory|\[DIR\])'; then
+            echo "${url}" >> "${OUTPUT_DIR}/vulns/${label}_dir_listing.txt"
+            echo -e "${RED}[!] Directory listing: ${url}${NC}"
+        fi
+    done < "${OUTPUT_DIR}/${label}_urls.txt" 2>/dev/null
+}
+
+# ====================================================
+# PHASE 8: SUBDOMAIN TAKEOVER CHECK
+# ====================================================
+check_takeovers() {
+    local label="$1"
+    echo -e "${YELLOW}[*] Checking for subdomain takeovers...${NC}"
+    
+    # Check for common takeover signatures
+    while IFS= read -r domain; do
+        if host "$domain" &>/dev/null; then
+            local cname
+            cname=$(host -t CNAME "$domain" 2>/dev/null | grep 'alias for' | awk '{print $NF}')
+            if [ -n "$cname" ]; then
+                # Check for unclaimed cloud services
+                if echo "$cname" | grep -qiE '(azureedge\.net|trafficmanager\.net|cloudapp\.net|azurewebsites\.net|azure-api\.net)'; then
+                    echo "$domain -> $cname" >> "${OUTPUT_DIR}/vulns/${label}_takeover_candidates.txt"
+                    echo -e "${YELLOW}[?] Potential takeover: $domain -> $cname${NC}"
+                fi
+            fi
+        fi
+    done < "${OUTPUT_DIR}/${label}_subdomains.txt" 2>/dev/null
+    
+    echo -e "${GREEN}[+] Takeover check complete${NC}"
+}
+
+# ====================================================
+# PHASE 9: REPORT GENERATION
+# ====================================================
+generate_report() {
+    local label="$1"
+    local total=$(cat "${OUTPUT_DIR}/${label}_subdomains.txt" 2>/dev/null | wc -l)
+    local live=$(cat "${OUTPUT_DIR}/${label}_urls.txt" 2>/dev/null | wc -l)
+    local urls=$(cat "${OUTPUT_DIR}/${label}_all_urls.txt" 2>/dev/null | wc -l)
+    local nuclei=$(cat "${OUTPUT_DIR}/vulns/${label}_nuclei.txt" 2>/dev/null | wc -l)
+    local xss=$(cat "${OUTPUT_DIR}/vulns/${label}_xss_candidates.txt" 2>/dev/null | wc -l)
+    local sqli=$(cat "${OUTPUT_DIR}/vulns/${label}_sqli_candidates.txt" 2>/dev/null | wc -l)
+    local ssrf=$(cat "${OUTPUT_DIR}/vulns/${label}_ssrf_candidates.txt" 2>/dev/null | wc -l)
+    local lfi=$(cat "${OUTPUT_DIR}/vulns/${label}_lfi_candidates.txt" 2>/dev/null | wc -l)
+    local redirects=$(cat "${OUTPUT_DIR}/vulns/${label}_redirect_candidates.txt" 2>/dev/null | wc -l)
+    
+    echo ""
+    echo -e "${CYAN}=========================================================${NC}"
+    echo -e "${CYAN}   SCAN REPORT: ${label}${NC}"
+    echo -e "${CYAN}=========================================================${NC}"
+    echo -e "  Subdomains found:     ${GREEN}${total}${NC}"
+    echo -e "  Live hosts:           ${GREEN}${live}${NC}"
+    echo -e "  Total URLs collected: ${GREEN}${urls}${NC}"
+    echo -e "  Nuclei findings:      ${YELLOW}${nuclei}${NC}"
+    echo -e "  XSS candidates:       ${YELLOW}${xss}${NC}"
+    echo -e "  SQLi candidates:      ${YELLOW}${sqli}${NC}"
+    echo -e "  SSRF candidates:      ${YELLOW}${ssrf}${NC}"
+    echo -e "  LFI candidates:       ${YELLOW}${lfi}${NC}"
+    echo -e "  Open redirect cands:  ${YELLOW}${redirects}${NC}"
+    echo -e "${CYAN}=========================================================${NC}"
+    echo ""
+    echo -e "Output files in: ${OUTPUT_DIR}/${NC}"
+    echo ""
+}
+
+# ====================================================
+# MAIN EXECUTION
+# ====================================================
+main() {
+    check_tools
+    
+    echo -e "${GREEN}[+] Starting Microsoft Hall of Fame recon pipeline...${NC}"
+    echo ""
+    
+    # Option 1: Scan all Microsoft domains (can take hours)
+    # for i in "${!MICROSOFT_DOMAINS[@]}"; do
+    #     domain="${MICROSOFT_DOMAINS[$i]}"
+    #     label="ms_$(echo $domain | tr . _)"
+    #     enum_subdomains "$domain" "$label"
+    #     filter_live "$label"
+    #     collect_urls "$label"
+    #     find_vulns "$label"
+    # done
+    
+    # Option 2: Scan a specific domain (faster, targeted)
+    local target="microsoft.com"
+    local label="microsoft_com"
+    
+    # Use single target if provided as argument
+    if [ -n "$1" ]; then
+        target="$1"
+        label=$(echo "$target" | tr . _)
+    fi
+    
+    echo -e "${GREEN}[+] Targeting: ${target}${NC}"
+    echo ""
+    
+    enum_subdomains "$target" "$label"
+    filter_live "$label"
+    collect_urls "$label"
+    find_vulns "$label"
+    run_nuclei "$label"
+    microsoft_specific_checks "$label"
+    check_takeovers "$label"
+    generate_report "$label"
+    
+    echo -e "${GREEN}[+] Done! Review findings in: ${OUTPUT_DIR}/${NC}"
+    echo -e "${GREEN}[+] Focus manual testing on the vulnerabilities identified above.${NC}"
+}
+
+main "$@"
